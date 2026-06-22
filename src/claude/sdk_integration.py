@@ -309,11 +309,14 @@ class ClaudeSDKManager:
                     path=str(claude_md_path),
                 )
 
-            # When DISABLE_TOOL_VALIDATION=true, pass None for allowed/disallowed
-            # tools so the SDK does not restrict tool usage (e.g. MCP tools).
+            # When DISABLE_TOOL_VALIDATION=true, pass EMPTY lists (not None) for
+            # allowed/disallowed tools: the SDK does list(allowed_tools) in
+            # _apply_skills_defaults and None crashes it ('NoneType' not iterable).
+            # Empty list => no allow/deny filter => all tools (incl. MCP) usable;
+            # with permission_mode=bypassPermissions there are no prompts either.
             if self.config.disable_tool_validation:
-                sdk_allowed_tools = None
-                sdk_disallowed_tools = None
+                sdk_allowed_tools = []
+                sdk_disallowed_tools = []
             else:
                 sdk_allowed_tools = self.config.claude_allowed_tools
                 sdk_disallowed_tools = self.config.claude_disallowed_tools
@@ -328,13 +331,18 @@ class ClaudeSDKManager:
                 disallowed_tools=sdk_disallowed_tools,
                 cli_path=self.config.claude_cli_path or None,
                 include_partial_messages=stream_callback is not None,
+                # YOLO: пропускать все запросы разрешений (агенты/Task/Bash/Edit
+                # без подтверждений). Полный доступ по требованию владельца.
+                permission_mode="bypassPermissions",
                 sandbox={
                     "enabled": self.config.sandbox_enabled,
                     "autoAllowBashIfSandboxed": True,
                     "excludedCommands": self.config.sandbox_excluded_commands or [],
                 },
                 system_prompt=base_prompt,
-                setting_sources=["project"],
+                # user+project+local = подхватить глобальный ~/.claude (MCP-серверы,
+                # skills, агенты) как у консольного Claude Code, не только проект.
+                setting_sources=["user", "project", "local"],
                 stderr=_stderr_callback,
             )
 

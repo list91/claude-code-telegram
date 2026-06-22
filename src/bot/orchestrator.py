@@ -18,10 +18,13 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaPhoto,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
     Update,
 )
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -41,6 +44,22 @@ from .utils.image_extractor import (
 )
 
 logger = structlog.get_logger()
+
+# Persistent reply-keyboard shown at the bottom of the chat (agentic mode).
+# Left = fresh session (/new), right = status. Taps send the label as plain
+# text, intercepted by _handle_kb_button before it reaches Claude.
+KB_NEW_SESSION = "🆕 Новая сессия"
+KB_STATUS = "📊 Статус"
+
+
+def _persistent_keyboard() -> ReplyKeyboardMarkup:
+    """Build the always-on bottom keyboard: [🆕 Новая сессия] [📊 Статус]."""
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(KB_NEW_SESSION), KeyboardButton(KB_STATUS)]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
 
 _MEDIA_TYPE_MAP = {
     "png": "image/png",
@@ -338,6 +357,19 @@ class MessageOrchestrator:
         for cmd, handler in handlers:
             app.add_handler(CommandHandler(cmd, self._inject_deps(handler)))
 
+        # Persistent reply-keyboard taps (🆕 Новая сессия / 📊 Статус) — intercept
+        # the label text in group 0, route to /new or /status, then stop so it
+        # never falls through to Claude (group 10).
+        app.add_handler(
+            MessageHandler(
+                filters.Regex(
+                    rf"^({re.escape(KB_NEW_SESSION)}|{re.escape(KB_STATUS)})$"
+                ),
+                self._inject_deps(self._handle_kb_button),
+            ),
+            group=0,
+        )
+
         # Text messages -> Claude
         app.add_handler(
             MessageHandler(
@@ -385,6 +417,14 @@ class MessageOrchestrator:
             CallbackQueryHandler(
                 self._inject_deps(self._handle_stop_callback),
                 pattern=r"^stop:",
+            )
+        )
+
+        # Status button callback
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._handle_status_callback),
+                pattern=r"^status:",
             )
         )
 
@@ -540,6 +580,7 @@ class MessageOrchestrator:
             f"Commands: /new (reset) · /status"
             f"{sync_line}",
             parse_mode="HTML",
+            reply_markup=_persistent_keyboard(),
         )
 
     async def agentic_new(
@@ -550,7 +591,10 @@ class MessageOrchestrator:
         context.user_data["session_started"] = True
         context.user_data["force_new_session"] = True
 
-        await update.message.reply_text("Session reset. What's next?")
+        await update.message.reply_text(
+            "Session reset. What's next?",
+            reply_markup=_persistent_keyboard(),
+        )
 
     async def agentic_status(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -579,6 +623,22 @@ class MessageOrchestrator:
         await update.message.reply_text(
             f"📂 {dir_display} · Session: {session_status}{cost_str}"
         )
+
+    async def _handle_kb_button(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Route persistent reply-keyboard taps to /new or /status, then stop.
+
+        Tapping a reply-keyboard button sends its label as a normal text
+        message; we catch it in group 0 and dispatch, raising
+        ApplicationHandlerStop so it never falls through to Claude (group 10).
+        """
+        text = (update.message.text or "").strip() if update.message else ""
+        if text == KB_NEW_SESSION:
+            await self.agentic_new(update, context)
+        elif text == KB_STATUS:
+            await self.agentic_status(update, context)
+        raise ApplicationHandlerStop
 
     def _get_verbose_level(self, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Return effective verbose level: per-user override or global default."""
@@ -941,7 +1001,7 @@ class MessageOrchestrator:
         # Create Stop button and interrupt event
         interrupt_event = asyncio.Event()
         stop_kb = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("Stop", callback_data=f"stop:{user_id}")]]
+            [[InlineKeyboardButton("⏹ Стоп", callback_data=f"stop:{user_id}")]]
         )
         progress_msg = await update.message.reply_text(
             "Working...", reply_markup=stop_kb
@@ -1109,7 +1169,9 @@ class MessageOrchestrator:
                         parse_mode=message.parse_mode,
                         reply_markup=None,  # No keyboards in agentic mode
                         reply_to_message_id=(
-                            update.message.message_id if i == 0 else None
+                            update.message.message_id
+                            if (i == 0 and self.settings.reply_quote)
+                            else None
                         ),
                     )
                     if i < len(formatted_messages) - 1:
@@ -1125,7 +1187,9 @@ class MessageOrchestrator:
                             message.text,
                             reply_markup=None,
                             reply_to_message_id=(
-                                update.message.message_id if i == 0 else None
+                                update.message.message_id
+                            if (i == 0 and self.settings.reply_quote)
+                            else None
                             ),
                         )
                     except Exception as plain_err:
@@ -1134,7 +1198,9 @@ class MessageOrchestrator:
                             f"(Telegram error: {str(plain_err)[:150]}). "
                             f"Please try again.",
                             reply_to_message_id=(
-                                update.message.message_id if i == 0 else None
+                                update.message.message_id
+                            if (i == 0 and self.settings.reply_quote)
+                            else None
                             ),
                         )
 
@@ -1314,7 +1380,9 @@ class MessageOrchestrator:
                         parse_mode=message.parse_mode,
                         reply_markup=None,
                         reply_to_message_id=(
-                            update.message.message_id if i == 0 else None
+                            update.message.message_id
+                            if (i == 0 and self.settings.reply_quote)
+                            else None
                         ),
                     )
                     if i < len(formatted_messages) - 1:
@@ -1525,7 +1593,9 @@ class MessageOrchestrator:
                     message.text,
                     parse_mode=message.parse_mode,
                     reply_markup=None,
-                    reply_to_message_id=(update.message.message_id if i == 0 else None),
+                    reply_to_message_id=(update.message.message_id
+                            if (i == 0 and self.settings.reply_quote)
+                            else None),
                 )
                 if i < len(formatted_messages) - 1:
                     await asyncio.sleep(0.5)
@@ -1700,6 +1770,48 @@ class MessageOrchestrator:
             await active.progress_msg.edit_text("Stopping...", reply_markup=None)
         except Exception:
             pass
+
+    async def _handle_status_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle status: callbacks — show session status as a popup alert."""
+        query = update.callback_query
+        target_user_id = int(query.data.split(":", 1)[1])
+
+        if query.from_user.id != target_user_id:
+            await query.answer(
+                "Only the requesting user can view this.", show_alert=True
+            )
+            return
+
+        current_dir = context.user_data.get(
+            "current_directory", self.settings.approved_directory
+        )
+        session_id = context.user_data.get("claude_session_id")
+        session_status = "active" if session_id else "none"
+
+        active = self._active_requests.get(target_user_id)
+        if active and not active.interrupted:
+            running = "выполняется"
+        elif active and active.interrupted:
+            running = "останавливается"
+        else:
+            running = "ожидание"
+
+        cost_str = ""
+        rate_limiter = context.bot_data.get("rate_limiter")
+        if rate_limiter:
+            try:
+                user_status = rate_limiter.get_user_status(target_user_id)
+                current_cost = user_status.get("cost_usage", {}).get("current", 0.0)
+                cost_str = f"\nCost: ${current_cost:.2f}"
+            except Exception:
+                pass
+
+        await query.answer(
+            f"📂 {current_dir}\nSession: {session_status} · {running}{cost_str}",
+            show_alert=True,
+        )
 
     async def _agentic_callback(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
