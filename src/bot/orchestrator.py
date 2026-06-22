@@ -52,6 +52,41 @@ KB_NEW_SESSION = "🆕 Новая сессия"
 KB_STATUS = "📊 Статус"
 
 
+def _usage_bar(percent: float, width: int = 10) -> str:
+    """Render a fixed-width ``█/░`` progress bar from a 0..100 percentage."""
+    pct = max(0.0, min(100.0, float(percent)))
+    filled = max(0, min(width, int(round(pct / 100 * width))))
+    return "█" * filled + "░" * (width - filled)
+
+
+def _fmt_tokens(n: int) -> str:
+    """Compact token count: 147900 -> ``147.9k``, 200000 -> ``200k``."""
+    if n >= 1000:
+        s = f"{n / 1000:.1f}".rstrip("0").rstrip(".")
+        return f"{s}k"
+    return str(n)
+
+
+def _parse_iso_local(iso: Optional[str]):
+    """Parse an ISO-8601 UTC string into a local-time ``datetime`` (or None)."""
+    if not iso:
+        return None
+    from datetime import datetime
+
+    try:
+        return datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone()
+    except (ValueError, TypeError):
+        return None
+
+
+def _fmt_reset(iso: Optional[str], *, weekly: bool) -> str:
+    """Reset label: weekly -> ``Jun 27``, otherwise local time ``21:29``."""
+    dt = _parse_iso_local(iso)
+    if not dt:
+        return "?"
+    return dt.strftime("%b %d") if weekly else dt.strftime("%H:%M")
+
+
 def _persistent_keyboard() -> ReplyKeyboardMarkup:
     """Build the always-on bottom keyboard: [🆕 Новая сессия] [📊 Статус]."""
     return ReplyKeyboardMarkup(
@@ -344,6 +379,7 @@ class MessageOrchestrator:
             ("start", self.agentic_start),
             ("new", self.agentic_new),
             ("status", self.agentic_status),
+            ("usage", self.agentic_usage),
             ("verbose", self.agentic_verbose),
             ("repo", self.agentic_repo),
             ("restart", command.restart_command),
@@ -498,6 +534,7 @@ class MessageOrchestrator:
                 BotCommand("start", "Start the bot"),
                 BotCommand("new", "Start a fresh session"),
                 BotCommand("status", "Show session status"),
+                BotCommand("usage", "Usage: context window + plan limits"),
                 BotCommand("verbose", "Set output verbosity (0/1/2)"),
                 BotCommand("repo", "List repos / switch workspace"),
                 BotCommand("restart", "Restart the bot"),
@@ -517,6 +554,7 @@ class MessageOrchestrator:
                 BotCommand("pwd", "Show current directory"),
                 BotCommand("projects", "Show all projects"),
                 BotCommand("status", "Show session status"),
+                BotCommand("usage", "Usage: context window + plan limits"),
                 BotCommand("export", "Export current session"),
                 BotCommand("actions", "Show quick actions"),
                 BotCommand("git", "Git repository commands"),
@@ -624,6 +662,72 @@ class MessageOrchestrator:
             f"📂 {dir_display} · Session: {session_status}{cost_str}"
         )
 
+    async def agentic_usage(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Rich status panel: context window + plan usage (5h / weekly / Sonnet).
+
+        Mirrors Claude Code's ``/usage``: the context-window line comes from the
+        last turn's token usage; the plan section is fetched live from the OAuth
+        usage endpoint (credentials shared with the Claude CLI).
+        """
+        from ..claude.usage_api import UsageError, fetch_plan_usage
+
+        lines = ["📊 <b>Claude — статус</b>", ""]
+
+        # --- Context window (last turn) ---
+        ctx_tokens = int(context.user_data.get("last_context_tokens") or 0)
+        ctx_window = int(context.user_data.get("last_context_window") or 0)
+        lines.append("<b>Context window</b>")
+        if ctx_tokens and ctx_window:
+            pct = ctx_tokens / ctx_window * 100
+            lines.append(f"<code>{_usage_bar(pct)}</code> {round(pct)}%")
+            lines.append(f"{_fmt_tokens(ctx_tokens)} / {_fmt_tokens(ctx_window)}")
+        else:
+            lines.append("<i>нет данных — отправь сообщение боту</i>")
+        lines.append("")
+
+        # --- Plan usage (live) ---
+        lines.append("<b>Plan usage</b>")
+        try:
+            plan = await fetch_plan_usage()
+            rows = [
+                ("5-hour limit", plan.five_hour, False),
+                ("Weekly · all models", plan.seven_day, True),
+                ("Sonnet only", plan.seven_day_sonnet, True),
+            ]
+            if plan.seven_day_opus:
+                rows.append(("Opus only", plan.seven_day_opus, True))
+            shown = False
+            for label, win, weekly in rows:
+                if not win:
+                    continue
+                shown = True
+                reset = _fmt_reset(win.resets_at, weekly=weekly)
+                lines.append(f"<b>{label}</b>")
+                lines.append(
+                    f"<code>{_usage_bar(win.percent)}</code> "
+                    f"{round(win.percent)}% · resets {reset}"
+                )
+            if not shown:
+                lines.append("<i>нет активных лимитов</i>")
+        except UsageError as exc:
+            lines.append(f"⚠️ недоступно: {exc}")
+        except Exception as exc:  # noqa: BLE001 — never crash the status panel
+            logger.warning("usage panel failed", error=str(exc))
+            lines.append(f"⚠️ ошибка: {exc}")
+
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    def _remember_context_usage(
+        self, context: ContextTypes.DEFAULT_TYPE, claude_response
+    ) -> None:
+        """Stash the last turn's context-window occupancy for the /usage panel."""
+        if getattr(claude_response, "context_tokens", 0):
+            context.user_data["last_context_tokens"] = claude_response.context_tokens
+            context.user_data["last_context_window"] = claude_response.context_window
+            context.user_data["last_model"] = claude_response.model
+
     async def _handle_kb_button(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -637,7 +741,7 @@ class MessageOrchestrator:
         if text == KB_NEW_SESSION:
             await self.agentic_new(update, context)
         elif text == KB_STATUS:
-            await self.agentic_status(update, context)
+            await self.agentic_usage(update, context)
         raise ApplicationHandlerStop
 
     def _get_verbose_level(self, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1081,6 +1185,7 @@ class MessageOrchestrator:
                 context.user_data["force_new_session"] = False
 
             context.user_data["claude_session_id"] = claude_response.session_id
+            self._remember_context_usage(context, claude_response)
 
             # Track directory changes
             from .handlers.message import _update_working_directory_from_claude_response
@@ -1336,6 +1441,7 @@ class MessageOrchestrator:
                 context.user_data["force_new_session"] = False
 
             context.user_data["claude_session_id"] = claude_response.session_id
+            self._remember_context_usage(context, claude_response)
 
             from .handlers.message import _update_working_directory_from_claude_response
 
@@ -1550,6 +1656,7 @@ class MessageOrchestrator:
             context.user_data["force_new_session"] = False
 
         context.user_data["claude_session_id"] = claude_response.session_id
+        self._remember_context_usage(context, claude_response)
 
         from .handlers.message import _update_working_directory_from_claude_response
 

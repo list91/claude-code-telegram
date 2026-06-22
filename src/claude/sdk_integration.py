@@ -59,6 +59,11 @@ class ClaudeResponse:
     error_type: Optional[str] = None
     tools_used: List[Dict[str, Any]] = field(default_factory=list)
     interrupted: bool = False
+    # Context-window occupancy of the last turn (input + cache tokens) and the
+    # model's window size, for the /usage panel. 0 when the SDK didn't report it.
+    context_tokens: int = 0
+    context_window: int = 0
+    model: Optional[str] = None
 
 
 @dataclass
@@ -524,14 +529,27 @@ class ClaudeSDKManager:
             tools_used: List[Dict[str, Any]] = []
             claude_session_id = None
             result_content = None
+            context_tokens = 0
+            model_name: Optional[str] = None
             for message in messages:
                 if isinstance(message, ResultMessage):
                     cost = getattr(message, "total_cost_usd", 0.0) or 0.0
                     claude_session_id = getattr(message, "session_id", None)
                     result_content = getattr(message, "result", None)
+                    # Context-window occupancy = whole prompt size of the last
+                    # turn (fresh input + cache read + cache creation tokens).
+                    usage = getattr(message, "usage", None)
+                    if isinstance(usage, dict):
+                        context_tokens = (
+                            int(usage.get("input_tokens") or 0)
+                            + int(usage.get("cache_read_input_tokens") or 0)
+                            + int(usage.get("cache_creation_input_tokens") or 0)
+                        )
                     current_time = asyncio.get_event_loop().time()
                     for msg in messages:
                         if isinstance(msg, AssistantMessage):
+                            if model_name is None:
+                                model_name = getattr(msg, "model", None)
                             msg_content = getattr(msg, "content", [])
                             if msg_content and isinstance(msg_content, list):
                                 for block in msg_content:
@@ -599,6 +617,21 @@ class ClaudeSDKManager:
                 tools_summary = ", ".join(unique_tool_names) or "unknown"
                 content = TASK_COMPLETED_MSG.format(tools_summary=tools_summary)
 
+            # Resolve the model's context-window size for the % display. Most
+            # Claude models expose 200k; BOT_CONTEXT_WINDOW overrides (1M betas).
+            context_window = 0
+            if context_tokens:
+                try:
+                    context_window = int(os.environ.get("BOT_CONTEXT_WINDOW") or 0)
+                except ValueError:
+                    context_window = 0
+                if context_window <= 0:
+                    context_window = (
+                        1_000_000
+                        if (model_name and "1m" in model_name.lower())
+                        else 200_000
+                    )
+
             return ClaudeResponse(
                 content=content,
                 session_id=final_session_id,
@@ -613,6 +646,9 @@ class ClaudeSDKManager:
                 ),
                 tools_used=tools_used,
                 interrupted=interrupted,
+                context_tokens=context_tokens,
+                context_window=context_window,
+                model=model_name,
             )
 
         except asyncio.TimeoutError:
