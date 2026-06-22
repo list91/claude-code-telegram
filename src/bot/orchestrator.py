@@ -380,6 +380,7 @@ class MessageOrchestrator:
             ("new", self.agentic_new),
             ("status", self.agentic_status),
             ("usage", self.agentic_usage),
+            ("sessions", self.agentic_sessions),
             ("verbose", self.agentic_verbose),
             ("repo", self.agentic_repo),
             ("restart", command.restart_command),
@@ -472,6 +473,14 @@ class MessageOrchestrator:
             )
         )
 
+        # Session switcher callbacks (/sessions), scoped by pattern
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._handle_sessions_callback),
+                pattern=r"^sess:",
+            )
+        )
+
         logger.info("Agentic handlers registered")
 
     def _register_classic_handlers(self, app: Application) -> None:
@@ -535,6 +544,7 @@ class MessageOrchestrator:
                 BotCommand("new", "Start a fresh session"),
                 BotCommand("status", "Show session status"),
                 BotCommand("usage", "Usage: context window + plan limits"),
+                BotCommand("sessions", "List / switch sessions in this folder"),
                 BotCommand("verbose", "Set output verbosity (0/1/2)"),
                 BotCommand("repo", "List repos / switch workspace"),
                 BotCommand("restart", "Restart the bot"),
@@ -555,6 +565,7 @@ class MessageOrchestrator:
                 BotCommand("projects", "Show all projects"),
                 BotCommand("status", "Show session status"),
                 BotCommand("usage", "Usage: context window + plan limits"),
+                BotCommand("sessions", "List / switch sessions in this folder"),
                 BotCommand("export", "Export current session"),
                 BotCommand("actions", "Show quick actions"),
                 BotCommand("git", "Git repository commands"),
@@ -718,6 +729,78 @@ class MessageOrchestrator:
             lines.append(f"⚠️ ошибка: {exc}")
 
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    async def agentic_sessions(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Список Claude-сессий текущей папки; переключение/новая через кнопки."""
+        from ..claude.sessions_list import list_sessions_for_dir
+
+        current_dir = context.user_data.get(
+            "current_directory", self.settings.approved_directory
+        )
+        current_id = context.user_data.get("claude_session_id")
+        sessions = list_sessions_for_dir(current_dir, limit=10)
+
+        rows: List[List[InlineKeyboardButton]] = []
+        for sess in sessions:
+            mark = "🟢" if sess["id"] == current_id else "⚪"
+            label = f"{mark} {sess['when']} · {sess['label']}"
+            if len(label) > 60:
+                label = label[:59] + "…"
+            rows.append(
+                [InlineKeyboardButton(label, callback_data=f"sess:{sess['id']}")]
+            )
+        rows.append([InlineKeyboardButton("➕ Новая сессия", callback_data="sess:new")])
+
+        active = (current_id or "—")[:8]
+        header = (
+            f"🗂 <b>Сессии</b> · <code>{current_dir}</code>\n"
+            f"Активная: <code>{active}</code> · найдено {len(sessions)}"
+        )
+        if not sessions:
+            header += (
+                "\n\n<i>Сохранённых сессий нет — отправь сообщение, чтобы создать.</i>"
+            )
+        await update.message.reply_text(
+            header, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows)
+        )
+
+    async def _handle_sessions_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Переключение/создание сессии из клавиатуры /sessions."""
+        query = update.callback_query
+        if query is None:
+            return
+        try:
+            await query.answer()
+        except Exception:
+            pass
+
+        parts = (query.data or "").split(":", 1)
+        target = parts[1] if len(parts) > 1 else ""
+
+        if target == "new":
+            context.user_data["claude_session_id"] = None
+            context.user_data["force_new_session"] = True
+            context.user_data["session_started"] = True
+            await query.edit_message_text(
+                "🆕 Новая сессия готова — отправь сообщение, чтобы начать."
+            )
+            return
+
+        if not target:
+            return
+
+        context.user_data["claude_session_id"] = target
+        context.user_data["force_new_session"] = False
+        context.user_data["session_started"] = True
+        await query.edit_message_text(
+            f"✅ Переключился на сессию <code>{target[:8]}</code>.\n"
+            "Следующее сообщение продолжит её.",
+            parse_mode="HTML",
+        )
 
     def _remember_context_usage(
         self, context: ContextTypes.DEFAULT_TYPE, claude_response
